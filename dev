@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# dev — globaler tmux-Launcher für alle Projekte unter ~/projects
+#
+#   dev                 zeigt ein Nummern-Menü aller Projekte
+#   dev <name>          startet/attached das passende Projekt (Teilstring genügt)
+#   dev -l | --list     listet die gefundenen Projekte
+#   dev -h | --help     diese Hilfe
+#
+# Pro Projekt wird eine eigene tmux-Session (Name = Projektordner) angelegt:
+#   ┌─────────────────────┬───────────────┐
+#   │  claude (Pane 0)    │ claude agents │  (Pane 1: Live-Status der
+#   │  — Interaktion      │   (Pane 1)    │   Team-Agenten dieses Projekts)
+#   └─────────────────────┴───────────────┘
+#
+# tmux-Basics:  abdocken = Strg-b d  ·  andocken = tmux attach -t <name>
+# Projektwurzel überschreibbar via  DEV_PROJECTS_DIR=…
+# ==============================================================================
+set -euo pipefail
+
+PROJECTS_DIR="${DEV_PROJECTS_DIR:-$HOME/projects}"
+
+die() { echo "dev: $*" >&2; exit 1; }
+
+usage() {
+  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# tmux-sicherer Session-Name (keine Punkte/Doppelpunkte).
+sanitize() { printf '%s' "$1" | tr '.:' '--'; }
+
+# Alle Projektverzeichnisse (ein Eintrag pro Zeile, sortiert).
+list_projects() {
+  find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+}
+
+# Kurzbeschreibung des Stacks (für die Menü-Anzeige).
+stack_for() {
+  local dir="$1"
+  [ -f "$dir/package.json" ]   && { echo "node/npm"; return; }
+  [ -f "$dir/pyproject.toml" ] && { echo "python/uv"; return; }
+  [ -f "$dir/Makefile" ]       && { echo "make"; return; }
+  echo "–"
+}
+
+start_session() {
+  local name="$1"
+  local project_dir="$PROJECTS_DIR/$name"
+  [ -d "$project_dir" ] || die "Projektverzeichnis nicht gefunden: $project_dir"
+
+  local session; session="$(sanitize "$name")"
+
+  # Schon vorhanden? -> nur andocken (bzw. innerhalb tmux umschalten).
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo "Session '$session' läuft bereits — docke an…"
+    if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$session"
+    else exec tmux attach -t "$session"; fi
+  fi
+
+  # Neue Session (detached); Session UND Fenster heißen wie das Repo.
+  # Pane-ID der Start-Pane direkt erfassen (robust gegen pane-base-index).
+  # Rechte Pane bekommt 40 % — links bleibt der Platz zum Interagieren.
+  local p0 p1
+  p0="$(tmux new-session -d -s "$session" -n "$session" -c "$project_dir" -P -F '#{pane_id}')"
+  # Fenster-Namen fixieren, damit tmux ihn nicht auf "claude"/"zsh" umbenennt.
+  tmux set-window-option -t "$session" automatic-rename off >/dev/null
+  p1="$(tmux split-window -h -l '40%' -t "$p0" -c "$project_dir" -P -F '#{pane_id}')"
+
+  # Pane 1 (rechts): Live-Status der Team-Agenten dieses Projekts.
+  tmux send-keys -t "$p1" "claude agents --cwd '$project_dir'" C-m
+  # Pane 0 (links): interaktive Claude-Session (Wrapper aus ~/.zshrc → Bypass) und fokussieren.
+  tmux send-keys -t "$p0" 'claude' C-m
+  tmux select-pane -t "$p0"
+
+  if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$session"
+  else exec tmux attach -t "$session"; fi
+}
+
+# --- Projekt anhand Query auflösen ---------------------------------------------
+# Exakter Treffer gewinnt; sonst Teilstring (case-insensitive).
+resolve() {
+  local query="$1"; local all; all="$(list_projects)"
+  if printf '%s\n' "$all" | grep -qxF "$query"; then printf '%s\n' "$query"; return; fi
+  printf '%s\n' "$all" | grep -iF "$query" || true
+}
+
+# --- Interaktives Nummern-Menü -------------------------------------------------
+choose_menu() {
+  local -a projects=()
+  while IFS= read -r line; do projects+=("$line"); done < <(list_projects)
+  [ "${#projects[@]}" -gt 0 ] || die "Keine Projekte unter $PROJECTS_DIR gefunden."
+
+  echo "Projekte in $PROJECTS_DIR:" >&2
+  local i
+  for i in "${!projects[@]}"; do
+    printf '  %2d) %-24s [%s]\n' "$((i+1))" "${projects[$i]}" "$(stack_for "$PROJECTS_DIR/${projects[$i]}")" >&2
+  done
+  printf 'Auswahl (Nummer, leer = abbrechen): ' >&2
+  local choice; read -r choice
+  [ -n "$choice" ] || { echo "Abgebrochen." >&2; exit 0; }
+  [[ "$choice" =~ ^[0-9]+$ ]] || die "Keine gültige Nummer: $choice"
+  [ "$choice" -ge 1 ] && [ "$choice" -le "${#projects[@]}" ] || die "Außerhalb des Bereichs: $choice"
+  printf '%s\n' "${projects[$((choice-1))]}"
+}
+
+# --- main ----------------------------------------------------------------------
+command -v tmux >/dev/null 2>&1 || die "tmux ist nicht installiert."
+[ -d "$PROJECTS_DIR" ] || die "Projektwurzel existiert nicht: $PROJECTS_DIR"
+
+case "${1:-}" in
+  -h|--help) usage 0 ;;
+  -l|--list)
+    while IFS= read -r p; do
+      printf '%-24s [%s]\n' "$p" "$(stack_for "$PROJECTS_DIR/$p")"
+    done < <(list_projects)
+    exit 0 ;;
+esac
+
+if [ $# -eq 0 ]; then
+  target="$(choose_menu)"
+else
+  matches="$(resolve "$1")"
+  count="$(printf '%s\n' "$matches" | grep -c . || true)"
+  if [ "$count" -eq 0 ]; then
+    die "Kein Projekt passt zu '$1'. Verfügbar: $(list_projects | paste -sd' ' -)"
+  elif [ "$count" -gt 1 ]; then
+    echo "Mehrere Treffer für '$1':" >&2
+    printf '  %s\n' $matches >&2
+    die "Bitte eindeutiger angeben."
+  fi
+  target="$matches"
+fi
+
+start_session "$target"
