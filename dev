@@ -4,17 +4,30 @@
 #
 #   dev                 zeigt ein Nummern-Menü aller Projekte
 #   dev <name>          startet/attached das passende Projekt (Teilstring genügt)
+#   dev init [name]     macht ein Projekt "team-ready" (CLAUDE.md, .claude/agents/)
 #   dev -l | --list     listet die gefundenen Projekte
 #   dev -h | --help     diese Hilfe
 #
 # Pro Projekt wird eine eigene tmux-Session (Name = Projektordner) angelegt:
 #   ┌─────────────────────┬───────────────┐
-#   │  claude (Pane 0)    │ claude agents │  (Pane 1: Live-Status der
-#   │  — Interaktion      │   (Pane 1)    │   Team-Agenten dieses Projekts)
+#   │  claude (Pane 0)    │ claude agents │  (Pane 1: Agent-View —
+#   │  — Interaktion      │   (Pane 1)    │   Background-Sessions)
 #   └─────────────────────┴───────────────┘
 #
+# Die linke Pane setzt deine letzte Konversation des Projekts fort, sobald es
+# eine gibt (Resume-Picker), sonst startet sie frisch. Steuerbar via DEV_RESUME.
+# Team-Agents (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1) erscheinen — da wir in
+# tmux laufen — als EIGENE zusätzliche Panes neben deiner Session (nicht in
+# Pane 1: `claude agents` zeigt nur Background-Sessions, keine Team-Teammates).
+# Ein Team entsteht erst auf Anfrage bzw. nach Bestätigung eines Vorschlags.
+#
 # tmux-Basics:  abdocken = Strg-b d  ·  andocken = tmux attach -t <name>
-# Projektwurzel überschreibbar via  DEV_PROJECTS_DIR=…
+#
+# Umgebungsvariablen:
+#   DEV_PROJECTS_DIR   Projektwurzel              (Default: ~/projects)
+#   DEV_RESUME         auto|resume|continue|fresh (Default: auto)
+#   DEV_PANE_DELAY     Sek. Verzögerung Pane 1    (Default: 2 — Race-Schutz)
+#   DEV_AGENT_ARGS     Extra-Flags für `claude agents` (z.B. "--model opus")
 # ==============================================================================
 set -euo pipefail
 
@@ -23,16 +36,17 @@ PROJECTS_DIR="${DEV_PROJECTS_DIR:-$HOME/projects}"
 die() { echo "dev: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  # Druckt den zusammenhängenden Kommentar-Header (ab Zeile 2) als Hilfetext.
+  sed -n '2,/^[^#]/ s/^#\( \|$\)//p' "$0"
   exit "${1:-0}"
 }
 
 # tmux-sicherer Session-Name (keine Punkte/Doppelpunkte).
 sanitize() { printf '%s' "$1" | tr '.:' '--'; }
 
-# Alle Projektverzeichnisse (ein Eintrag pro Zeile, sortiert).
+# Alle Projektverzeichnisse (ein Eintrag pro Zeile, sortiert; ohne Dotdirs).
 list_projects() {
-  find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+  find "$PROJECTS_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' 2>/dev/null | sort
 }
 
 # Kurzbeschreibung des Stacks (für die Menü-Anzeige).
@@ -40,8 +54,28 @@ stack_for() {
   local dir="$1"
   [ -f "$dir/package.json" ]   && { echo "node/npm"; return; }
   [ -f "$dir/pyproject.toml" ] && { echo "python/uv"; return; }
+  [ -f "$dir/Cargo.toml" ]     && { echo "rust/cargo"; return; }
+  [ -f "$dir/go.mod" ]         && { echo "go"; return; }
   [ -f "$dir/Makefile" ]       && { echo "make"; return; }
   echo "–"
+}
+
+# Heuristik: hat das Projekt bereits gespeicherte Claude-Sessions? Der Store
+# liegt unter ~/.claude/projects/<cwd-mit-Slashes-als-Bindestrichen>/.
+have_sessions() {
+  local store="$HOME/.claude/projects/$(printf '%s' "$1" | sed 's#/#-#g')"
+  [ -d "$store" ] && [ -n "$(find "$store" -maxdepth 1 -name '*.jsonl' -print -quit 2>/dev/null)" ]
+}
+
+# Befehl für die linke (interaktive) Pane bestimmen.
+claude_left_cmd() {
+  local dir="$1"
+  case "${DEV_RESUME:-auto}" in
+    fresh)    echo "claude" ;;
+    continue) echo "claude --continue" ;;
+    resume)   echo "claude --resume" ;;
+    auto|*)   if have_sessions "$dir"; then echo "claude --resume"; else echo "claude"; fi ;;
+  esac
 }
 
 start_session() {
@@ -70,16 +104,116 @@ start_session() {
   # Pane 0 (links) ZUERST: interaktive Claude-Session (Wrapper aus ~/.zshrc →
   # Bypass). Nur dieser Start patcht ~/.claude.json — er muss seinen jq+mv und
   # Claude-Startup abschließen, bevor Pane 1 die Datei (lesend) anfasst.
-  tmux send-keys -t "$p0" 'claude' C-m
+  # Setzt die letzte Konversation des Projekts fort, falls vorhanden.
+  tmux send-keys -t "$p0" "$(claude_left_cmd "$project_dir")" C-m
   tmux select-pane -t "$p0"
 
-  # Pane 1 (rechts): Live-Status der Team-Agenten dieses Projekts. Die Pane
-  # wartet SELBST (Race-Schutz), damit Pane 0 die Config fertig schreibt —
-  # so dockt tmux sofort an, nur die Agents-Pane verzögert sich.
-  tmux send-keys -t "$p1" "sleep ${DEV_PANE_DELAY:-2}; claude agents --cwd '$project_dir'" C-m
+  # Pane 1 (rechts): Agent-View (`claude agents`) — Live-Status der
+  # Background-Sessions dieses Projekts. (Team-Teammates erscheinen separat als
+  # eigene tmux-Panes, nicht hier.)
+  # Die Pane wartet SELBST (Race-Schutz), damit Pane 0 die Config fertig
+  # schreibt — so dockt tmux sofort an, nur die Agents-Pane verzögert sich.
+  tmux send-keys -t "$p1" "sleep ${DEV_PANE_DELAY:-2}; claude agents --cwd '$project_dir' ${DEV_AGENT_ARGS:-}" C-m
 
   if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$session"
   else exec tmux attach -t "$session"; fi
+}
+
+# --- Projekt "team-ready" machen -----------------------------------------------
+# Legt CLAUDE.md, .claude/agents/ (Beispiel-Subagents) und ein .claude/
+# settings.json an. Idempotent: vorhandene Dateien werden nie überschrieben.
+scaffold_project() {
+  local dir="$1"
+  [ -d "$dir" ] || die "Verzeichnis nicht gefunden: $dir"
+  local name; name="$(basename "$dir")"
+  local n_new=0 n_skip=0
+
+  mkdir -p "$dir/.claude/agents"
+
+  _write() {  # _write <pfad> ; Inhalt kommt von stdin
+    local path="$1"
+    if [ -e "$path" ]; then
+      printf '  übersprungen: %s (existiert)\n' "${path#"$dir"/}" >&2; n_skip=$((n_skip+1))
+      cat >/dev/null  # stdin leeren
+    else
+      cat > "$path"
+      printf '  angelegt:     %s\n' "${path#"$dir"/}" >&2; n_new=$((n_new+1))
+    fi
+  }
+
+  # CLAUDE.md inline (kein Pipe → keine Subshell, Zähler bleiben gültig).
+  if [ -e "$dir/CLAUDE.md" ]; then
+    echo "  übersprungen: CLAUDE.md (existiert)" >&2; n_skip=$((n_skip+1))
+  else
+    { printf '# %s\n\n' "$name"; cat <<'EOF'
+Kurzbeschreibung des Projekts (eine Zeile).
+
+## Stack
+-
+
+## Befehle
+- Build:
+- Test:
+- Lint:
+
+## Konventionen
+-
+
+## Subagents
+In `.claude/agents/` liegen projektspezifische Subagents (z. B. `code-reviewer`,
+`test-runner`). Claude delegiert anhand der `description` automatisch; bei
+aktivierten Agent-Teams werden sie als Teammates gespawnt. Erweitere sie nach Bedarf.
+EOF
+    } > "$dir/CLAUDE.md"
+    echo "  angelegt:     CLAUDE.md" >&2; n_new=$((n_new+1))
+  fi
+
+  _write "$dir/.claude/agents/code-reviewer.md" <<'EOF'
+---
+description: Reviewt den aktuellen Diff auf Korrektheits-Bugs, bevor committet wird. Proaktiv nach größeren Änderungen einsetzen.
+tools: Read, Grep, Glob, Bash
+model: opus
+---
+
+Du bist ein sorgfältiger Code-Reviewer. Prüfe den aktuellen Diff (`git diff`) auf:
+
+- Korrektheitsfehler: Off-by-one, Null/Undefined, falsche Bedingungen, Race Conditions
+- fehlende Fehlerbehandlung und unbehandelte Edge Cases
+- Sicherheitsprobleme: Injection, Secrets im Code, unsichere Defaults
+- Abweichungen von den Konventionen in CLAUDE.md
+
+Gib konkrete, umsetzbare Befunde mit `Datei:Zeile` aus. Keine Stil-Nitpicks ohne
+Substanz. Wenn nichts Kritisches da ist, sag das klar.
+EOF
+
+  _write "$dir/.claude/agents/test-runner.md" <<'EOF'
+---
+description: Findet und führt die Tests des Projekts aus und fasst Fehlschläge zusammen. Einsetzen, wenn Tests laufen oder Fehler analysiert werden sollen.
+tools: Read, Grep, Glob, Bash
+---
+
+Du bist für die Testausführung zuständig. Erkenne das Test-Setup (package.json-
+Scripts, pytest, `go test`, Cargo, Makefile-Targets) und führe die passende Suite
+aus. Bei Fehlschlägen:
+
+- nenne die fehlgeschlagenen Tests namentlich
+- zitiere die relevante Fehlermeldung (knapp)
+- nenne die wahrscheinliche Ursache und die betroffene `Datei:Zeile`
+
+Ändere keinen Produktivcode, ohne dass du ausdrücklich darum gebeten wirst.
+EOF
+
+  _write "$dir/.claude/settings.json" <<'EOF'
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json"
+}
+EOF
+
+  echo "Fertig: $n_new angelegt, $n_skip übersprungen." >&2
+  if [ "$n_new" -gt 0 ]; then
+    echo "Tipp: 'dev $name' startet das Projekt mit Agents-Pane." >&2
+  fi
+  return 0
 }
 
 # --- Projekt anhand Query auflösen ---------------------------------------------
@@ -119,6 +253,17 @@ case "${1:-}" in
     while IFS= read -r p; do
       printf '%-24s [%s]\n' "$p" "$(stack_for "$PROJECTS_DIR/$p")"
     done < <(list_projects)
+    exit 0 ;;
+  init)
+    shift
+    if [ $# -ge 1 ]; then
+      target_dir="$PROJECTS_DIR/$1"
+      [ -d "$target_dir" ] || die "Projekt nicht gefunden: $target_dir"
+    else
+      target_dir="$PWD"
+    fi
+    echo "Scaffolding für: $target_dir" >&2
+    scaffold_project "$target_dir"
     exit 0 ;;
 esac
 
