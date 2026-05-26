@@ -67,11 +67,16 @@ start_session() {
   tmux set-window-option -t "$session" automatic-rename off >/dev/null
   p1="$(tmux split-window -h -l '40%' -t "$p0" -c "$project_dir" -P -F '#{pane_id}')"
 
-  # Pane 1 (rechts): Live-Status der Team-Agenten dieses Projekts.
-  tmux send-keys -t "$p1" "claude agents --cwd '$project_dir'" C-m
-  # Pane 0 (links): interaktive Claude-Session (Wrapper aus ~/.zshrc → Bypass) und fokussieren.
+  # Pane 0 (links) ZUERST: interaktive Claude-Session (Wrapper aus ~/.zshrc →
+  # Bypass). Nur dieser Start patcht ~/.claude.json — er muss seinen jq+mv und
+  # Claude-Startup abschließen, bevor Pane 1 die Datei (lesend) anfasst.
   tmux send-keys -t "$p0" 'claude' C-m
   tmux select-pane -t "$p0"
+
+  # Pane 1 (rechts): Live-Status der Team-Agenten dieses Projekts. Die Pane
+  # wartet SELBST (Race-Schutz), damit Pane 0 die Config fertig schreibt —
+  # so dockt tmux sofort an, nur die Agents-Pane verzögert sich.
+  tmux send-keys -t "$p1" "sleep ${DEV_PANE_DELAY:-2}; claude agents --cwd '$project_dir'" C-m
 
   if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$session"
   else exec tmux attach -t "$session"; fi
