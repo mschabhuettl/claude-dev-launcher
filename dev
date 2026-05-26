@@ -10,14 +10,16 @@
 #
 # Pro Projekt wird eine eigene tmux-Session (Name = Projektordner) angelegt:
 #   ┌─────────────────────┬───────────────┐
-#   │  claude (Pane 0)    │ claude agents │  (Pane 1: Live-Status der
-#   │  — Interaktion      │   (Pane 1)    │   Team-/Background-Agenten)
+#   │  claude (Pane 0)    │ claude agents │  (Pane 1: Agent-View —
+#   │  — Interaktion      │   (Pane 1)    │   Background-Sessions)
 #   └─────────────────────┴───────────────┘
 #
 # Die linke Pane setzt deine letzte Konversation des Projekts fort, sobald es
 # eine gibt (Resume-Picker), sonst startet sie frisch. Steuerbar via DEV_RESUME.
 # Team-Agents (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1) erscheinen — da wir in
-# tmux laufen — automatisch als zusätzliche Panes neben deiner Session.
+# tmux laufen — als EIGENE zusätzliche Panes neben deiner Session (nicht in
+# Pane 1: `claude agents` zeigt nur Background-Sessions, keine Team-Teammates).
+# Ein Team entsteht erst auf Anfrage bzw. nach Bestätigung eines Vorschlags.
 #
 # tmux-Basics:  abdocken = Strg-b d  ·  andocken = tmux attach -t <name>
 #
@@ -106,7 +108,9 @@ start_session() {
   tmux send-keys -t "$p0" "$(claude_left_cmd "$project_dir")" C-m
   tmux select-pane -t "$p0"
 
-  # Pane 1 (rechts): Live-Status der Team-/Background-Agenten dieses Projekts.
+  # Pane 1 (rechts): Agent-View (`claude agents`) — Live-Status der
+  # Background-Sessions dieses Projekts. (Team-Teammates erscheinen separat als
+  # eigene tmux-Panes, nicht hier.)
   # Die Pane wartet SELBST (Race-Schutz), damit Pane 0 die Config fertig
   # schreibt — so dockt tmux sofort an, nur die Agents-Pane verzögert sich.
   tmux send-keys -t "$p1" "sleep ${DEV_PANE_DELAY:-2}; claude agents --cwd '$project_dir' ${DEV_AGENT_ARGS:-}" C-m
